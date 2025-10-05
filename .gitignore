@@ -1,0 +1,27 @@
+# Credentials
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+.bkuprc
+bkuprc
+!bkuprc.example
+.rclone.conf
+*credentials*
+*secrets*
+*.env
+
+# Backup data
+backups/
+*.db
+*.sqlite*
+*.tar.gz
+*.zip
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db

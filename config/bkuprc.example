@@ -1,0 +1,91 @@
+# =============================================================================
+# BKUP CONFIGURATION - EXAMPLE
+# =============================================================================
+# Copy this file to ~/.bkuprc and customize
+# DO NOT commit the actual config file to Git - it's in .gitignore
+# =============================================================================
+
+# =============================================================================
+# BASIC SETTINGS
+# =============================================================================
+
+BACKUP_BASE="/mnt/d/backups"
+MIRROR_BASE="/mnt/e/backups"
+RETENTION_DAYS=30
+
+# =============================================================================
+# CLOUD BACKUP SETTINGS
+# =============================================================================
+
+CLOUD_ENABLED=true
+CLOUD_REMOTE="encrypted-b2:bkup-backups"
+MAX_CLOUD_FILE_SIZE=10
+CLOUD_AUTO_SYNC=true
+CLOUD_BW_LIMIT="50M"
+
+# =============================================================================
+# PERFORMANCE TUNING
+# =============================================================================
+
+NICE_LEVEL=10
+IONICE_CLASS=3
+MAX_RSYNC_BW=""
+SMALL_FILE_THRESHOLD=1000
+
+# =============================================================================
+# SERVER DEFINITIONS
+# =============================================================================
+
+declare -A SERVERS
+
+# Example servers (replace with your own):
+SERVERS["prod-web"]="prod-web|Production Web Server|1"
+SERVERS["prod-db"]="prod-db|Production Database Server|1"
+SERVERS["dev-server"]="dev-server|Development Server|2"
+
+# =============================================================================
+# BACKUP PATH DEFINITIONS
+# =============================================================================
+
+# Example: Production Web Server
+PROD_WEB_PATHS=(
+    "/var/www/html|rsync|exclude:cache/*,*.log"
+    "/var/www/html/database.db|database|integrity_check:true"
+    "/etc/nginx|tar|name:nginx_config.tar.gz"
+    "/etc/letsencrypt|tar|name:ssl_certs.tar.gz"
+)
+
+# Example: Production Database Server
+PROD_DB_PATHS=(
+    "/var/lib/mysql|tar|name:mysql_data.tar.gz"
+    "/etc/mysql|tar|name:mysql_config.tar.gz"
+)
+
+# Example: Development Server
+DEV_SERVER_PATHS=(
+    "/var/www/html|rsync|"
+    "/etc/apache2|tar|name:apache_config.tar.gz"
+)
+
+# =============================================================================
+# LOCAL BACKUPS:1
+
+# =============================================================================
+
+ANDROID_REPO_PATH="/mnt/c/Users/YOUR_USERNAME/source/repos"
+ANDROID_REPO_PATTERN="*YourProject*"
+
+WSL_BACKUP_PATHS=(
+    "$HOME|tar|exclude:.cache,*.log|name:wsl-home.tar.gz"
+    "$HOME/bin/bkup*|tar|name:wsl-scripts.tar.gz"
+)
+
+# =============================================================================
+# NOTIFICATIONS
+# =============================================================================
+
+EMAIL_ALERTS=false
+ALERT_EMAIL="your-email@example.com"
+WEBHOOK_URL=""
+
+# ================
