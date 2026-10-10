@@ -1,0 +1,10 @@
+# /etc/bkup/prepare.conf: settings for bkup-prepare, on the server being backed up. All optional.
+
+# A database that wants a password: the file it is kept in, as a line NAME=password, and the NAME.
+# Only that one line is read. The file is not run, and the password is not written anywhere.
+#DB_PASSWORD_FILE=/etc/myapp/app.env
+#DB_PASSWORD_NAME=DB_ROOT_PASSWORD
+
+# Where to look for SQLite databases, and where not to.
+#SQLITE_ROOTS="/var/www /opt /root /etc /home /srv /usr/local"
+#SQLITE_SKIP="/var/backups/bkup /var/lib/mysql /var/lib/lxd /var/snap /proc /sys /dev /run"

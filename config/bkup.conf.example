@@ -1,0 +1,16 @@
+# /etc/bkup/bkup.conf: settings for bkup, on the machine that keeps the backups.
+
+NAME=myserver                       # what to call the server in the store
+SOURCE="bkup-source:"               # an ssh name (see /root/.ssh/config) and a colon
+
+# What to pull. /var/backups/bkup is where the server's bkup-prepare leaves its database copies.
+PATHS="/etc /root /home /usr/local /var/www /var/spool/cron /var/backups/bkup /opt"
+EXCLUDES=".cache/ node_modules/ *.sock lost+found/"
+
+REPO=/mnt/disk1/bkup/restic         # the encrypted store
+REPO_DISK=/mnt/disk1                # the disk it is on: nothing is written unless this is mounted
+COPIES="/mnt/disk2:/mnt/disk2/bkup/restic"      # more stores to copy to, each as  mount-point:folder
+STICK_LABELS="BKUP1 BKUP2"          # labels of backup sticks: whichever is plugged in gets a copy
+
+PASSFILE=/root/.bkup-pass           # the one secret. Without it the store cannot be read: keep a copy elsewhere.
+KEEP="--keep-daily 14 --keep-weekly 8 --keep-monthly 12"

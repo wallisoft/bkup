@@ -1,0 +1,200 @@
+#!/bin/bash
+# bkup: run on the machine that keeps the backups, as root, every night.
+#
+#   1. Pulls the server's files here over ssh, read-only (the server cannot reach, change or delete its backups).
+#   2. Adds them to an encrypted store (restic): each night is a full picture, but only what changed takes room.
+#   3. Copies the store to a second disk, and to a backup stick if one is plugged in.
+#   4. Thins out old nights, and once a week checks the store can still be read.
+#   5. Writes what happened to /var/lib/bkup/status.json, for a person or a program to read.
+#
+#   bkup              the nightly run
+#   bkup status       what happened last time
+#   bkup snapshots    the nights that are kept
+#   bkup restore DIR  put the newest night's files in DIR (add a snapshot id to choose another night)
+#   bkup check        read back part of the store to prove it is sound
+#
+# Settings: /etc/bkup/bkup.conf (see config/bkup.conf.example).
+set -u
+umask 077
+export LC_ALL=C
+
+CONF="${BKUP_CONF:-/etc/bkup/bkup.conf}"
+NAME=server                                   # what to call the server in the store
+SOURCE=""                                     # where to pull from: an ssh name and a colon ("myserver:")
+PATHS="/etc /root /home /usr/local /var/www /var/spool/cron /var/backups/bkup /opt"
+EXCLUDES=".cache/ node_modules/ *.sock lost+found/"
+STAGE=/var/lib/bkup/stage                     # the plain copy of the server's files, on this machine's own disk
+STATE=/var/lib/bkup
+REPO=""                                       # the encrypted store
+REPO_DISK=""                                  # the disk it is on: nothing is written unless this is mounted
+COPIES=""                                     # other stores to copy it to, each as  disk-mount-point:store-folder
+STICK_LABELS=""                               # labels of backup sticks: whichever is plugged in gets a copy
+STICK_FOLDER=bkup/restic
+PASSFILE=/root/.bkup-pass                     # the one secret: without it the store cannot be read. Keep a copy elsewhere.
+KEEP="--keep-daily 14 --keep-weekly 8 --keep-monthly 12"
+STALE_HOURS=26                                # how old the server's own preparation may be before it is a problem
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+
+LOG="$STATE/bkup.log"
+STATUS="$STATE/status.json"
+steps=()                                      # each: name|ok or problem|what happened
+problems=0
+
+say() { printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOG" >&2; }
+step() {                                      # step NAME ok|problem DETAIL
+    [ "$2" = ok ] || problems=$((problems + 1))
+    steps+=("$1|$2|$3"); say "$1: $2: $3"
+}
+json() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n\t' '  '; }
+write_status() {
+    local out="$STATUS.part" first=1 s
+    {
+        printf '{\n  "name": "%s",\n  "started": "%s",\n  "finished": "%s",\n  "ok": %s,\n  "problems": %s,\n' \
+            "$(json "$NAME")" "$started" "$(date '+%F %T')" "$([ "$problems" -eq 0 ] && echo true || echo false)" "$problems"
+        printf '  "snapshot": "%s",\n  "store": "%s",\n  "store_size": "%s",\n  "steps": [' "$(json "${snapshot:-}")" "$(json "$REPO")" "$(json "${store_size:-}")"
+        for s in "${steps[@]}"; do
+            [ $first -eq 1 ] || printf ','
+            first=0
+            printf '\n    { "step": "%s", "result": "%s", "detail": "%s" }' "$(json "${s%%|*}")" "$(json "$(echo "$s" | cut -d'|' -f2)")" "$(json "$(echo "$s" | cut -d'|' -f3-)")"
+        done
+        printf '\n  ]\n}\n'
+    } > "$out" && mv "$out" "$STATUS"
+}
+restic_() { restic --password-file "$PASSFILE" "$@"; }
+need() {
+    [ -n "$REPO" ] && [ -n "$REPO_DISK" ] || { echo "REPO and REPO_DISK are not set in $CONF"; exit 2; }
+    [ -r "$PASSFILE" ] || { echo "There is no $PASSFILE. Make one (see docs/SETUP.md) and keep a copy somewhere else."; exit 2; }
+    command -v restic >/dev/null || { echo "restic is not installed (apt install restic)"; exit 2; }
+}
+mounted() { mountpoint -q "$1"; }
+
+case "${1:-run}" in
+status)
+    [ -r "$STATUS" ] && cat "$STATUS" || echo "bkup has not run yet"
+    exit 0 ;;
+snapshots)
+    need; restic_ -r "$REPO" snapshots; exit $? ;;
+restore)
+    need
+    [ -n "${2:-}" ] || { echo "bkup restore DIR [snapshot]"; exit 2; }
+    mkdir -p "$2" && restic_ -r "$REPO" restore "${3:-latest}" --target "$2"
+    exit $? ;;
+check)
+    need; restic_ -r "$REPO" check --read-data-subset=10%; exit $? ;;
+run) ;;
+*)  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac
+
+# ---------------------------------------------------------------- the nightly run
+[ "$(id -u)" -eq 0 ] || { echo "bkup runs as root, so the files it pulls keep their owners"; exit 2; }
+need
+[ -n "$SOURCE" ] || { echo "SOURCE is not set in $CONF"; exit 2; }
+mkdir -p "$STATE" "$STAGE"
+exec 9> "$STATE/lock"
+flock -n 9 || { echo "bkup is already running"; exit 1; }
+started=$(date '+%F %T')
+snapshot=""; store_size=""
+trap 'write_status' EXIT
+say "---- bkup of $NAME from $SOURCE"
+
+# Nothing is written unless the disk the store lives on is really there: otherwise a missing disk would
+# quietly fill this machine's own.
+if ! mounted "$REPO_DISK"; then
+    step store problem "$REPO_DISK is not mounted, so nothing was backed up"
+    exit 1
+fi
+
+# 1. pull
+args=(-aHAX --numeric-ids --relative --delete --delete-excluded --timeout=600)
+for e in $EXCLUDES; do args+=(--exclude "$e"); done
+srcs=()
+for p in $PATHS; do srcs+=("${SOURCE}${p}"); done
+out=$(rsync "${args[@]}" "${srcs[@]}" "$STAGE/" 2>&1); code=$?
+case $code in
+    0)  step pull ok "$(du -sh "$STAGE" 2>/dev/null | cut -f1) pulled from $SOURCE" ;;
+    24) step pull ok "$(du -sh "$STAGE" 2>/dev/null | cut -f1) pulled from $SOURCE (some files went while they were being copied, as happens on a busy server)" ;;
+    23) # something asked for was missing or could not be read: what did come is still backed up, but it is said
+        step pull problem "$(du -sh "$STAGE" 2>/dev/null | cut -f1) pulled, but not everything: $(echo "$out" | grep -E 'rsync: |rsync error' | head -1)" ;;
+    *)  step pull problem "rsync stopped ($code): $(echo "$out" | grep -v '^$' | tail -1)"
+        exit 1 ;;                                 # an incomplete pull is not made into a night's backup
+esac
+
+# the server's own preparation (its database copies): was it done, lately, and cleanly?
+prep="$STAGE/var/backups/bkup/STATUS"
+if [ -r "$prep" ]; then
+    at=$(grep -m1 '^finished_epoch=' "$prep" | cut -d= -f2); bad=$(grep -m1 '^problems=' "$prep" | cut -d= -f2)
+    age=$(( ( $(date +%s) - ${at:-0} ) / 3600 ))
+    if [ "$age" -gt "$STALE_HOURS" ]; then step databases problem "the server last prepared its databases $age hours ago"
+    elif [ "${bad:-0}" != 0 ]; then step databases problem "the server had $bad problem(s) preparing its databases (see /var/backups/bkup there)"
+    else step databases ok "prepared $age hour(s) ago, no problems"; fi
+else
+    step databases problem "the server has not prepared its databases (bkup-prepare has not run there)"
+fi
+
+# 2. into the store
+if [ ! -e "$REPO/config" ]; then
+    mkdir -p "$REPO"
+    if out=$(restic_ -r "$REPO" init 2>&1); then step store ok "a new store was made at $REPO"
+    else step store problem "the store could not be made: $(echo "$out" | tail -1)"; exit 1; fi
+fi
+if out=$(cd "$STAGE" && restic_ -r "$REPO" backup . --host "$NAME" --tag bkup 2>&1); then
+    snapshot=$(echo "$out" | sed -n 's/^snapshot \([0-9a-f]*\) saved.*/\1/p' | tail -1)
+    step backup ok "$(echo "$out" | grep -E '^Added to the repo' | sed 's/^Added to the repository: /added /') as snapshot ${snapshot:-?}"
+else
+    step backup problem "$(echo "$out" | tail -1)"
+    exit 1
+fi
+
+# 3. thin out the old nights
+# shellcheck disable=SC2086
+if out=$(restic_ -r "$REPO" forget --host "$NAME" --tag bkup $KEEP --prune 2>&1); then
+    step thin ok "$(restic_ -r "$REPO" snapshots --host "$NAME" --json 2>/dev/null | grep -o '"short_id"' | wc -l) nights kept"
+else
+    step thin problem "$(echo "$out" | tail -1)"
+fi
+store_size=$(du -sh "$REPO" 2>/dev/null | cut -f1)
+
+# 4. copies: each is a store of its own, so damage to one is not copied to the others
+copy_to() {                                    # copy_to WHAT STORE
+    local what=$1 to=$2 out
+    if [ ! -e "$to/config" ]; then
+        mkdir -p "$to"
+        out=$(restic_ -r "$to" init --from-repo "$REPO" --from-password-file "$PASSFILE" --copy-chunker-params 2>&1) \
+            || { step "$what" problem "could not start a store there: $(echo "$out" | tail -1)"; return 1; }
+    fi
+    if out=$(restic_ -r "$to" copy --from-repo "$REPO" --from-password-file "$PASSFILE" 2>&1); then
+        # shellcheck disable=SC2086
+        restic_ -r "$to" forget --host "$NAME" --tag bkup $KEEP --prune >/dev/null 2>&1
+        step "$what" ok "up to date, $(du -sh "$to" 2>/dev/null | cut -f1)"
+    else
+        step "$what" problem "$(echo "$out" | tail -1)"; return 1
+    fi
+}
+for c in $COPIES; do
+    disk=${c%%:*}; to=${c#*:}
+    if mounted "$disk"; then copy_to "copy on $disk" "$to"; else step "copy on $disk" problem "$disk is not mounted"; fi
+done
+
+# a backup stick, if one is in: mounted for the copy and let go again, so it can be pulled out at any time
+stick=""
+for label in $STICK_LABELS; do
+    dev=$(blkid -L "$label" 2>/dev/null) || continue
+    [ -n "$dev" ] || continue
+    stick=$label
+    at=$(findmnt -rno TARGET -S "$dev" | head -1); ours=0
+    if [ -z "$at" ]; then at="$STATE/stick"; mkdir -p "$at"; mount "$dev" "$at" 2>/dev/null && ours=1 || { step "stick $label" problem "it is plugged in but would not mount"; continue; }; fi
+    copy_to "stick $label" "$at/$STICK_FOLDER"
+    sync
+    [ $ours -eq 1 ] && umount "$at" 2>/dev/null
+done
+[ -n "$STICK_LABELS" ] && [ -z "$stick" ] && step stick ok "no backup stick is plugged in (nothing to do)"
+
+# 5. once a week, read part of the store back
+if [ "$(date +%u)" = 7 ] || [ "${BKUP_CHECK:-}" = 1 ]; then
+    if out=$(restic_ -r "$REPO" check --read-data-subset=5% 2>&1); then step check ok "the store reads back sound"
+    else step check problem "$(echo "$out" | grep -iE 'error|fatal' | head -1)"; fi
+fi
+
+say "---- done: $problems problem(s)"
+[ "$problems" -eq 0 ]

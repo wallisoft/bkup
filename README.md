@@ -1,280 +1,79 @@
 # bkup
 
-**A comprehensive, intelligent backup solution for Linux servers with encrypted cloud storage**
+Nightly, encrypted, pull-based backups of a Linux server, kept on a machine of your own, with copies on a
+second disk and on a stick you can take away.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Shell Script](https://img.shields.io/badge/Shell-Bash-green.svg)](https://www.gnu.org/software/bash/)
-
----
-
-## 🎯 Overview
-
-`bkup` is an enterprise-grade backup orchestration system designed for developers managing multiple servers. It intelligently handles file backups using the optimal method (tar for many files, rsync for few), maintains encrypted cloud backups, and provides comprehensive monitoring and management tools.
-
-### Key Features
-
-**🌟 Standout Innovations:**
-
-- **🎯 Smart Tar/Rsync Selection** - Automatically detects file count and chooses optimal backup method
-  - **rsync** for directories with <1000 files (incremental, efficient)
-  - **tar** for directories with >1000 files (10x faster on first run!)
-  - *Invaluable for servers hosting large numbers of small files (book covers, images, etc.)*
-  
-- **⏱️ 5-Tier Database Snapshots with 5-Minute Granularity**
-  - Great-grandson (5-min) → Grandson (hourly) → Son (daily) → Father (weekly) → Grandfather (monthly)
-  - **Maximum 5-minute data loss** for production databases
-  - Immediate rollback capability with minimal overhead
-  - *Far superior to traditional daily backup approaches*
-
-**Additional Features:**
-
-- 🔐 **Encrypted Cloud Backup** - Backblaze B2 with client-side encryption
-- 📊 **Size-Aware Filtering** - Configurable limits for cloud uploads (saves 95% on costs)
-- 🔄 **Multi-Server Support** - SSH-based backup of remote servers
-- 💾 **Local Redundancy** - Automatic mirroring to redundant drives
-- 🎨 **Terminal GUI** - Easy configuration management
-- 📝 **Comprehensive Logging** - Detailed logs and filtering reports
-- ⏰ **Automated Scheduling** - Cron-based automation
-- 🔒 **Lock File Protection** - Prevents concurrent backup runs
-
-### Cost-Effective Cloud Storage
-
-With smart filtering (default 10MB limit), typical cloud costs:
-- **Without filtering:** ~$3/month for 500GB
-- **With filtering:** ~$0.06-0.24/month for 20-50GB
-- **Savings:** ~95% reduction while protecting critical data
-
----
-
-## 📋 Requirements
-
-- Linux or WSL2 (Ubuntu 22.04+ recommended)
-- Bash 4.0+
-- SSH access to remote servers (key-based authentication)
-- rsync, tar, sqlite3
-- rclone (for cloud backup)
-- Backblaze B2 account (optional, for cloud backup)
-
----
-
-## 🚀 Quick Start
-
-```bash
-# 1. Clone the repository
-git clone https://github.com/YOUR_USERNAME/bkup.git
-cd bkup
-
-# 2. Run the installation wizard
-chmod +x install.sh
-./install.sh
-
-# 3. Run your first backup
-bkup
-```
-
----
-
-## 💻 Usage
-
-```bash
-bkup              # Run full backup
-bkup sync         # Cloud sync only
-bkup mirror       # Mirror to redundant drive
-bkup config       # Open configuration GUI
-bkup snapshot     # Database snapshot
-```
-
----
-
-## 🔬 Technical Highlights
-
-### Smart Tar/Rsync Selection
-
-Traditional backup scripts use either rsync (slow for many files) or tar (no incrementals). `bkup` intelligently chooses based on file count:
-
-```bash
-# Automatically detects file count
-if directory has < 1000 files:
-    use rsync (incremental, efficient for changes)
-else:
-    use tar (10x faster for initial backup)
-```
-
-**Real-world impact:**
-- Book cover repository with 20,000+ files: **30+ minutes → 2-3 minutes**
-- Small config directories: Incremental rsync efficiency maintained
-- Best of both worlds, automatically
-
-### 5-Tier Database Snapshots
-
-Unlike traditional daily backups, `bkup` implements a sophisticated GFS (Grandfather-Father-Son) rotation:
+Two small shell scripts around tools that have earned their trust: `rsync` to fetch, `restic` to store.
 
 ```
-Great-grandson: Every 5 minutes (during business hours)
-Grandson:       Hourly
-Son:            Daily (with integrity check)
-Father:         Weekly (with integrity check)
-Grandfather:    Monthly (with integrity check)
+   the server                         the machine that keeps the backups
+  ┌────────────────────┐   rsync    ┌────────────────────────────────────────────┐
+  │ bkup-prepare 02:30 │  over ssh  │ bkup 03:30                                 │
+  │  safe copies of    │ ─────────▶ │  pull ─▶ encrypted store on disk 1         │
+  │  every database    │ read-only  │              ├─▶ copy on disk 2            │
+  └────────────────────┘            │              └─▶ copy on a stick, if in    │
+                                    └────────────────────────────────────────────┘
 ```
 
-**Benefits:**
-- **Maximum 5-minute data loss** (vs 24 hours with daily backups)
-- Immediate rollback to any 5-minute interval
-- Minimal overhead (SQLite online backup)
-- Automatic rotation prevents disk bloat
-- Integrity verification on long-term snapshots
+## Why it is built this way
 
-**Use case:** Production database corruption at 14:37? Restore from 14:35 snapshot in seconds.
+- **The backups are pulled, not pushed.** The server holds no key to the place its backups live, so someone
+  who breaks into the server cannot reach, change or delete them. The key that does the pulling is tied on the
+  server to one thing, reading files with rsync: it cannot run a command or write a byte.
+- **Databases are copied properly.** Copying a database's files while it runs gives a broken copy some of the
+  time. `bkup-prepare` dumps each MariaDB/MySQL database in one transaction and copies each SQLite file through
+  SQLite's own backup, into `/var/backups/bkup`, and notes how the machine is set up (packages, services, cron
+  jobs, disks) for the day it has to be rebuilt.
+- **Everything is encrypted before it is kept.** A real backup of a server holds its passwords and its
+  customers' data. The store can sit on a stick in a glovebox and give nothing away.
+- **Every night is a full picture, and only what changed takes room.** Fourteen days, eight weeks and twelve
+  months are kept by default.
+- **Each copy is a store of its own.** Damage to one is not copied onto the others.
+- **Nothing is written unless the backup disk is really there.** A disk that didn't mount does not quietly
+  fill the system disk.
+- **It says what happened.** `/var/lib/bkup/status.json` after every run, for a person or a program.
 
----
+## Setting up
 
-## 📦 What Gets Backed Up
+On the machine that keeps the backups (as root, in a copy of this repository):
 
-### Remote Servers (via SSH)
-- Website files and databases
-- Configuration files (Apache, PHP, nginx, etc.)
-- SSL certificates
-- Cron jobs
-- User home directories
+    ./install-store.sh NAME SERVER-ADDRESS STORE-DISK [SECOND-DISK]
 
-### Local Data
-- Development repositories
-- WSL instance
-- Scripts and configurations
+It prints one line to run on the server:
 
-### Smart Filtering (Cloud Only)
-**Uploaded to cloud:**
-- ✅ Databases and configs
-- ✅ Source code
-- ✅ Scripts and documentation
-- ✅ Files under 10MB
+    ./install-server.sh 'ssh-ed25519 AAAA… bkup read-only pull' [PASSWORD-FILE PASSWORD-NAME]
 
-**Kept locally only:**
-- ❌ Files over 10MB
-- ❌ Archives (.iso, .zip, .tar)
-- ❌ Media files (.mp4, .mp3)
-- ❌ Build artifacts (node_modules, build/)
+Then, back on the backup machine:
 
----
+    bkup            # the first night (it will run by itself after this, at 03:30)
+    bkup status
 
-## 🗂️ Project Structure
+**Keep a copy of `/root/.bkup-pass` somewhere else.** It is the one secret: without it nobody can read the
+backups, you included. More in [docs/SETUP.md](docs/SETUP.md).
 
-```
-bkup/
-├── bin/
-│   ├── bkup              # Main orchestration script
-│   ├── bkup-sync         # Cloud sync with filtering
-│   ├── bkup-mirror       # Local drive mirroring
-│   ├── bkup-snapshot     # Database snapshots
-│   └── bkup-config       # Terminal GUI
-├── config/
-│   └── bkuprc.example    # Example configuration
-├── docs/
-│   ├── SETUP.md
-│   ├── CONFIGURATION.md
-│   └── ARCHITECTURE.md
-├── install.sh
-├── LICENSE
-└── README.md
-```
+## Using it
 
----
+    bkup status            what happened last night
+    bkup snapshots         the nights that are kept
+    bkup restore DIR       put the newest night's files in DIR
+    bkup restore DIR ID    …or another night's
+    bkup check             read back part of the store to prove it is sound
 
-## 🔐 Security & Credentials
+A backup you have never restored from is a hope, not a backup. Restore into a spare folder (or a spare machine)
+when you set this up, and now and then after.
 
-**This project NEVER stores credentials in Git.**
+## What it does not do (yet)
 
-All sensitive data is handled through:
-- Interactive setup wizard
-- Local config files (git-ignored)
-- SSH key-based authentication
-- rclone encrypted configuration
+- It backs up one server per backup machine config. More servers means more configs, by hand.
+- It does not back up containers or virtual machines as such, only the files in the paths you give it.
+- It does not send an alert when a night fails: read `bkup status`, or have something read `status.json`.
+- There is no copy to a cloud store built in, though restic can do that, and a copy step would be small.
 
-See [docs/SETUP.md](docs/SETUP.md) for secure credential management.
+## Needs
 
----
+Debian or Ubuntu on both machines (it uses `apt`, `rrsync` and cron), root on both, and ssh from the backup
+machine to the server. `tests/run.sh` runs the whole thing end to end in a temporary folder.
 
-## 🛠️ Configuration
+## Licence
 
-### Quick Configuration
-```bash
-bkup config
-```
-
-### Manual Configuration
-Edit `~/.bkuprc`:
-```bash
-# Cloud settings
-CLOUD_ENABLED=true
-MAX_CLOUD_FILE_SIZE=10  # MB
-
-# Backup locations
-BACKUP_BASE="/mnt/d/backups"
-MIRROR_BASE="/mnt/e/backups"
-
-# Performance
-NICE_LEVEL=10
-IONICE_CLASS=3
-```
-
----
-
-## 📚 Documentation
-
-- **[Setup Guide](docs/SETUP.md)** - Complete installation and configuration
-- **[Configuration Reference](docs/CONFIGURATION.md)** - All config options
-- **[Architecture](docs/ARCHITECTURE.md)** - How the system works
-- **[Troubleshooting](docs/TROUBLESHOOTING.md)** - Common issues
-
----
-
-## 🤝 Contributing
-
-Contributions welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) first.
-
----
-
-## 👥 Authors
-
-**Created by:**
-- **Steve** ([@YOUR_GITHUB_USERNAME](https://github.com/YOUR_USERNAME)) - Concept, requirements, testing, implementation
-- **Claude (Anthropic)** - Architecture, development, documentation
-
-**Inspired by:**
-- Unix philosophy: Do one thing well
-- The Culture series by Iain M. Banks
-- The open-source backup community
-
-This project demonstrates what's possible through human-AI collaboration on practical problems.
-
----
-
-## 📄 License
-
-MIT License - see [LICENSE](LICENSE) file for details.
-
----
-
-## 🙏 Acknowledgments
-
-- Backblaze for affordable B2 cloud storage
-- The rsync and rclone communities
-- Everyone who believes in proper backups
-
----
-
-## ⚠️ Disclaimer
-
-Always test your backups and verify restore procedures before relying on them in production.
-
----
-
-## 💡 Support
-
-- 📖 [Documentation](docs/)
-- 🐛 [GitHub Issues](https://github.com/YOUR_USERNAME/bkup/issues)
-- 💬 [Discussions](https://github.com/YOUR_USERNAME/bkup/discussions)
-
----
-
-**Remember: The best backup is the one you actually test restoring!** 🚀
+MIT. Made by Steve at Wallisoft with Claude (Anthropic).

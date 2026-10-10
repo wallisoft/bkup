@@ -1,0 +1,137 @@
+#!/bin/bash
+# bkup-prepare: run on the server being backed up, as root, shortly before the backup is pulled.
+#
+# Files can be copied while a server runs; databases can't, not safely. This makes a consistent copy of every
+# database, and a note of how the machine is set up, in one folder for the backup to collect:
+#
+#   /var/backups/bkup/mariadb/<database>.sql    each MariaDB or MySQL database, dumped in one transaction
+#   /var/backups/bkup/sqlite/<full path>        each SQLite file, copied through SQLite's own backup
+#   /var/backups/bkup/system/                   packages, services, cron jobs, disks, addresses: what a rebuild needs
+#   /var/backups/bkup/STATUS                    when this ran and whether anything went wrong
+#
+# Settings are optional, in /etc/bkup/prepare.conf (see config/prepare.conf.example).
+set -u
+umask 077
+
+OUT=/var/backups/bkup
+SQLITE_ROOTS="/var/www /opt /root /etc /home /srv /usr/local"
+SQLITE_SKIP="/var/backups/bkup /var/lib/mysql /var/lib/lxd /var/snap /proc /sys /dev /run"
+DB_PASSWORD_FILE=""          # a file with a line NAME=password, for a database that wants one
+DB_PASSWORD_NAME=""          # the NAME on that line
+[ -r "${BKUP_PREPARE_CONF:-/etc/bkup/prepare.conf}" ] && . "${BKUP_PREPARE_CONF:-/etc/bkup/prepare.conf}"
+
+problems=0
+say() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
+problem() { problems=$((problems + 1)); say "PROBLEM: $*"; }
+
+mkdir -p "$OUT/mariadb" "$OUT/sqlite" "$OUT/system" || { echo "can't write to $OUT"; exit 1; }
+started=$(date '+%F %T')
+
+# ---------------------------------------------------------------- MariaDB / MySQL
+dump=$(command -v mariadb-dump || command -v mysqldump || true)
+client=$(command -v mariadb || command -v mysql || true)
+if [ -n "$dump" ] && [ -n "$client" ]; then
+    if [ -n "$DB_PASSWORD_FILE" ] && [ -r "$DB_PASSWORD_FILE" ]; then
+        # only the one line is read: the file is not run, and the password is never written anywhere
+        MYSQL_PWD=$(grep -m1 "^${DB_PASSWORD_NAME}=" "$DB_PASSWORD_FILE" | cut -d= -f2- | sed -e 's/^["'\'']//' -e 's/["'\'']$//')
+        export MYSQL_PWD
+    fi
+    if names=$("$client" -N -B -e 'show databases' 2>/dev/null); then
+        count=0
+        for db in $names; do
+            case "$db" in information_schema|performance_schema|sys) continue ;; esac
+            if "$dump" --single-transaction --quick --routines --events --triggers --skip-dump-date \
+                    --databases "$db" > "$OUT/mariadb/$db.sql.part" 2>"$OUT/mariadb/$db.err"; then
+                mv "$OUT/mariadb/$db.sql.part" "$OUT/mariadb/$db.sql"; rm -f "$OUT/mariadb/$db.err"; count=$((count + 1))
+            else
+                rm -f "$OUT/mariadb/$db.sql.part"; problem "database $db didn't dump: $(head -1 "$OUT/mariadb/$db.err")"
+            fi
+        done
+        for old in "$OUT"/mariadb/*.sql; do          # a database that has been dropped: its dump goes too
+            [ -e "$old" ] || continue
+            name=$(basename "$old" .sql)
+            printf '%s\n' $names | grep -qx "$name" || rm -f "$old"
+        done
+        say "MariaDB: $count databases dumped"
+    else
+        problem "MariaDB is here but wouldn't let this in (set DB_PASSWORD_FILE and DB_PASSWORD_NAME in /etc/bkup/prepare.conf)"
+    fi
+    unset MYSQL_PWD
+else
+    say "MariaDB: none here"
+fi
+
+# ---------------------------------------------------------------- SQLite
+if command -v sqlite3 >/dev/null; then
+    skip=()
+    for s in $SQLITE_SKIP; do skip+=(-path "$s" -prune -o); done
+    list=$(mktemp)
+    copied=0; same=0
+    for root in $SQLITE_ROOTS; do
+        [ -d "$root" ] || continue
+        find "$root" -xdev "${skip[@]}" -type f \( -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' -o -name '*.s3db' \) -print0 2>/dev/null
+    done > "$list.found"
+    while IFS= read -r -d '' f; do
+        [ "$(head -c 15 "$f" 2>/dev/null)" = "SQLite format 3" ] || continue
+        case "$f" in *"'"*) problem "skipped (a quote in its name): $f"; continue ;; esac
+        dest="$OUT/sqlite$f"
+        printf '%s\n' "$dest" >> "$list"
+        # unchanged since last time: nothing to do (a database in use keeps its newest changes in a -wal file)
+        if [ -e "$dest" ] && [ "$dest" -nt "$f" ] && { [ ! -e "$f-wal" ] || [ "$dest" -nt "$f-wal" ]; }; then same=$((same + 1)); continue; fi
+        mkdir -p "$(dirname "$dest")"
+        if sqlite3 "$f" ".timeout 10000" ".backup '$dest.part'" 2>/dev/null && [ -s "$dest.part" ]; then
+            mv "$dest.part" "$dest"; copied=$((copied + 1))
+        else
+            rm -f "$dest.part"; problem "SQLite file didn't copy: $f"
+        fi
+    done < "$list.found"
+    # a database that has gone from the server: its copy goes too
+    find "$OUT/sqlite" -type f ! -name '*.part' -print 2>/dev/null | while IFS= read -r have; do
+        grep -qxF "$have" "$list" || rm -f "$have"
+    done
+    find "$OUT/sqlite" -depth -type d -empty -delete 2>/dev/null
+    rm -f "$list" "$list.found"
+    say "SQLite: $copied copied, $same unchanged"
+else
+    problem "sqlite3 isn't installed, so SQLite databases were not copied (apt install sqlite3)"
+fi
+
+# ---------------------------------------------------------------- how this machine is set up
+S="$OUT/system"
+note() { local file=$1; shift; "$@" > "$S/$file" 2>/dev/null || true; }
+note os-release cat /etc/os-release
+note kernel uname -a
+note hostname hostname -f
+note packages dpkg --get-selections
+note packages-chosen apt-mark showmanual
+note snaps snap list
+note services-enabled systemctl list-unit-files --state=enabled --no-pager
+note timers systemctl list-timers --all --no-pager
+note disks lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,UUID,MOUNTPOINTS
+note mounts findmnt -A
+note space df -hT
+note addresses ip -br addr
+note routes ip route
+note listening ss -tulnp
+note firewall ufw status verbose
+note containers lxc list
+note users getent passwd
+note groups getent group
+if command -v nginx >/dev/null; then nginx -T > "$S/nginx-as-running" 2>/dev/null || true; fi
+: > "$S/crontabs"
+for u in $(cut -d: -f1 /etc/passwd); do
+    tab=$(crontab -l -u "$u" 2>/dev/null) || continue
+    printf '##### %s\n%s\n\n' "$u" "$tab" >> "$S/crontabs"
+done
+say "System: noted"
+
+# ---------------------------------------------------------------- done
+{
+    echo "started=$started"
+    echo "finished=$(date '+%F %T')"
+    echo "finished_epoch=$(date +%s)"
+    echo "problems=$problems"
+    echo "size=$(du -sh "$OUT" 2>/dev/null | cut -f1)"
+} > "$OUT/STATUS"
+say "Done: $problems problem(s), $(du -sh "$OUT" 2>/dev/null | cut -f1) in $OUT"
+[ "$problems" -eq 0 ]
